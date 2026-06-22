@@ -6,7 +6,7 @@ Design a Databricks pipeline that decrypts sensitive fields in CASMEX data using
 
 The pipeline supports two independent execution modes that share the same decryption library:
 
-1. **Initial Load** — reads encrypted records from the bronze layer and writes decrypted output to a CRM SQL Server.
+1. **Initial Load** — reads encrypted records from the bronze layer, writes decrypted output to Parquet files on cloud storage, and relies on Azure Data Factory (ADF) to load those files into CRM SQL Server.
 2. **Real-Time Sync** — reads encrypted events from Kafka input topics and writes decrypted events to Kafka output topics.
 
 Both modes handle multiple tables and topics dynamically through configuration.
@@ -28,6 +28,7 @@ This design covers:
 This design does not cover:
 
 - Upstream CASMEX encryption implementation
+- ADF pipeline design for loading Parquet files into CRM SQL Server
 - Schema design for the CRM SQL Server target tables
 - Key rotation procedures inside Azure Key Vault beyond runtime consumption of the active key
 - Re-encryption or masking of already-decrypted data at rest
@@ -149,7 +150,7 @@ sequenceDiagram
 
 ### 6.1 Purpose
 
-Decrypt all encrypted records from the bronze layer tables and load the plaintext output into the CRM SQL Server. This is a bounded, batch operation.
+Decrypt all encrypted records from the bronze layer tables and write the plaintext output to Parquet files on cloud storage. Azure Data Factory (ADF) then reads those Parquet files and loads the data into CRM SQL Server. This is a bounded, batch operation.
 
 ### 6.2 High-level flow
 
@@ -157,7 +158,8 @@ Decrypt all encrypted records from the bronze layer tables and load the plaintex
 Bronze Layer (DX_MST_DATA tables)
     → Spark Batch Read
     → Per-table decryption using shared Decryption Module
-    → Write to CRM SQL Server (target table per source table)
+    → Write decrypted output to Parquet files on cloud storage
+    → ADF reads Parquet files and loads into CRM SQL Server
     → Log completion / errors
 ```
 
@@ -169,6 +171,8 @@ sequenceDiagram
     participant Job as Databricks Batch Job
     participant Bronze as Bronze Layer
     participant Crypto as Decryption Module
+    participant Parquet as Parquet Output (Cloud Storage)
+    participant ADF as Azure Data Factory
     participant SQL as CRM SQL Server
     participant ErrLog as Error Log / Dead-letter
 
@@ -179,11 +183,13 @@ sequenceDiagram
         Job->>Crypto: Initialise decryption context (KEK + DEK for table)
         Job->>Crypto: Decrypt configured fields (batch UDF / map)
         alt Decryption successful
-            Job->>SQL: Write decrypted rows to target table
+            Job->>Parquet: Write decrypted rows to output Parquet path
         else Decryption failed for row
             Job->>ErrLog: Write raw row + failure details
         end
     end
+    ADF->>Parquet: Read decrypted Parquet files
+    ADF->>SQL: Load rows into CRM SQL Server target table
 ```
 
 ### 6.4 Runtime parameters
@@ -192,8 +198,8 @@ sequenceDiagram
 |---|---|
 | `tables` | List of source/target table pairs with per-table field lists |
 | `bronze_database` | Databricks / Unity Catalog database for bronze tables |
-| `sql_server_jdbc_url` | JDBC URL for CRM SQL Server |
-| `sql_server_secret_scope` | Secret scope name for SQL Server credentials |
+| `parquet_output_base_path` | Base path on cloud storage where decrypted Parquet files are written (one sub-directory per table) |
+| `parquet_write_mode` | `overwrite` or `append` for each target Parquet path |
 | `kek_secret_scope` | Databricks secret scope name |
 | `kek_secret_key` | Secret key name for the KEK |
 | `dek_table` | Fully qualified name of `DX_MST_DATA.KEYVAL` |
@@ -201,17 +207,16 @@ sequenceDiagram
 | `salt` | PBKDF2 SALT value (externalized, not hardcoded) |
 | `pbkdf2_iterations` | Number of PBKDF2 iterations (default: 1000) |
 | `error_output_path` | Location for failed-record dead-letter output |
-| `write_mode` | `overwrite` or `append` for each target table |
 
 ### 6.5 Multi-table processing
 
 The job reads the `tables` configuration list at startup. For each entry the job:
 
-1. Resolves the source bronze table name and target SQL Server table name.
+1. Resolves the source bronze table name and the target Parquet output path for that table.
 2. Resolves the DEK for that table from `DX_MST_DATA.KEYVAL` using the configured key column.
 3. Initialises a decryption context (Steps 1–7 of Section 5.1) specific to that table's DEK.
 4. Applies field-level decryption (Step 8) only to the columns listed for that table.
-5. Writes decrypted rows to the SQL Server target table.
+5. Writes decrypted rows to the Parquet output path (`parquet_output_base_path/{table_name}/`).
 6. Routes failed rows to the error output path with table name and failure reason.
 
 Tables are processed sequentially by default. Parallel table processing may be enabled with job-level concurrency controls.
@@ -359,7 +364,7 @@ decrypt_field(ciphertext_b64):
 | Base64 decode failure for a field value | Route record to error output; continue processing |
 | AES-CBC decryption failure for a field | Route record to error output; continue processing |
 | Malformed record (missing field, null key) | Route record to error output; continue processing |
-| SQL Server write failure (initial load) | Retry with backoff; raise alert if unresolvable |
+| Parquet write failure (initial load) | Retry with backoff; raise alert if unresolvable |
 | Kafka write failure (real-time sync) | Retry with backoff; raise alert if unresolvable |
 
 ### 11.2 Error record schema
@@ -401,7 +406,7 @@ Failed records are routed to the error output (dead-letter path or error topic) 
 - Restrict secret scope access to the job's service principal with least privilege.
 - Mask all key material in job logs and monitoring outputs.
 - Do not persist decrypted PII values to intermediate debug storage, checkpoints, or monitoring outputs.
-- Use encrypted transport (TLS) for Kafka connectivity, SQL Server JDBC connections, and Databricks platform integrations.
+- Use encrypted transport (TLS) for Kafka connectivity, cloud storage access, and Databricks platform integrations.
 - CBC padding oracle attacks are mitigated by ensuring decryption failures are handled uniformly without leaking timing information in the error path.
 - Treat any decryption failure as a potential security event: count, alert, and do not silently drop.
 
@@ -462,7 +467,7 @@ Both jobs run under a service principal or managed identity with:
 
 - Read access to the `DX_MST_DATA` bronze database
 - Read access to the Databricks secret scope (KEK)
-- Write access to CRM SQL Server (initial load)
+- Write access to the Parquet output storage location (initial load)
 - Read access to Kafka input topics (real-time sync)
 - Write access to Kafka output and error topics (real-time sync)
 
@@ -473,7 +478,7 @@ Each environment externalises:
 - Kafka endpoints and security settings
 - Input and output topic names
 - Bronze database and KEYVAL table path
-- SQL Server JDBC URL and credential secret
+- Parquet output base path and write mode (initial load)
 - Secret scope and KEK secret key name
 - PBKDF2 SALT value
 - Checkpoint base path
@@ -505,7 +510,7 @@ Each environment externalises:
 
 | Mode | Source | Target |
 |---|---|---|
-| Initial Load | Bronze layer tables | CRM SQL Server |
+| Initial Load | Bronze layer tables | Parquet files on cloud storage (ADF loads into CRM SQL Server) |
 | Real-Time Sync | Kafka input topics | Kafka output topics |
 
 ---
@@ -517,7 +522,7 @@ Each environment externalises:
 - Confirm whether the PBKDF2 SALT is the same for the KEK derivation step and the field-level derivation step, or whether separate SALTs are configured for each.
 - Confirm whether the AES-CBC decryption of the DEK includes PKCS5/PKCS7 padding (standard CBC) or uses a fixed-length unpadded block.
 - Confirm the list of encrypted columns per CASMEX table and Kafka topic for the initial configuration.
-- Confirm the target SQL Server table schema and write semantics (insert-only, upsert, or full overwrite) for the initial load.
+- Confirm the target SQL Server table schema and write semantics (insert-only, upsert, or full overwrite) for the ADF load from Parquet.
 - Confirm Kafka topic naming convention for input and output pairs.
 - Confirm retention policy for the Kafka error topic and dead-letter path for the initial load.
 - Confirm whether DEK rotation is a supported operational procedure and, if so, whether a rolling restart or in-flight refresh is required.
@@ -526,4 +531,4 @@ Each environment externalises:
 
 ## 19. Summary
 
-The CASMEX decryption pipeline uses a two-stage key hierarchy: the KEK is retrieved from Azure Key Vault through a Databricks secret scope and used with PBKDF2 to unwrap the encrypted DEK stored in the `DX_MST_DATA.KEYVAL` bronze table. The decrypted DEK is UTF-8 encoded, SHA-256 hashed, and used with PBKDF2 to derive the final AES-256-CBC field-level key and IV. This shared decryption module is consumed by two execution modes: a batch initial-load job that reads from the bronze layer and writes to CRM SQL Server, and a Spark Structured Streaming real-time sync job that reads from Kafka input topics and publishes to Kafka output topics. Both modes support dynamic multi-table and multi-topic configuration driven entirely by job parameters.
+The CASMEX decryption pipeline uses a two-stage key hierarchy: the KEK is retrieved from Azure Key Vault through a Databricks secret scope and used with PBKDF2 to unwrap the encrypted DEK stored in the `DX_MST_DATA.KEYVAL` bronze table. The decrypted DEK is UTF-8 encoded, SHA-256 hashed, and used with PBKDF2 to derive the final AES-256-CBC field-level key and IV. This shared decryption module is consumed by two execution modes: a batch initial-load job that reads from the bronze layer and writes decrypted output to Parquet files on cloud storage (which ADF subsequently loads into CRM SQL Server), and a Spark Structured Streaming real-time sync job that reads from Kafka input topics and publishes to Kafka output topics. Both modes support dynamic multi-table and multi-topic configuration driven entirely by job parameters.
