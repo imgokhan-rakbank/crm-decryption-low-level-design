@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-Design a Databricks Spark Structured Streaming pipeline that reads CRM events from an Infobip Kafka topic, decrypts configured sensitive fields, and writes the decrypted payload to the downstream target in near real time.
+Design a Databricks Spark Structured Streaming pipeline that reads CRM events from an Infobip Kafka topic, decrypts configured sensitive fields, and writes the decrypted payload to a downstream Kafka topic in near real time.
 
 ## 2. Scope
 
@@ -12,7 +12,7 @@ This design covers:
 - Retrieval of the RSA private key through Databricks secrets backed by Azure Key Vault
 - Decryption of the per-message AES key
 - Decryption of parameterized sensitive fields in dynamic JSON messages
-- Streaming error handling, observability, and operational controls
+- Kafka output publishing, streaming error handling, observability, and operational controls
 
 This design does not cover:
 
@@ -33,8 +33,36 @@ Infobip publishes CRM-related events where selected fields are encrypted with a 
 5. The RSA private key is retrieved from Databricks secrets (Azure Key Vault-backed scope).
 6. The job decrypts `encKey` to obtain the AES key for the current message.
 7. The job decrypts only the configured sensitive fields, such as `from`, `to`, and `text`.
-8. The job emits the decrypted event together with processing metadata.
-9. Records that cannot be decrypted are routed to an error stream/table with the failure reason and raw payload reference.
+8. The job writes the decrypted event to an output Kafka topic.
+9. The output payload preserves the same structure as the input payload, with configured sensitive fields replaced in place by plaintext values and no additional fields added.
+10. Records that cannot be decrypted are routed to a dedicated error path with the failure reason and raw payload reference.
+
+## 4.1 Mermaid sequence diagram
+
+```mermaid
+sequenceDiagram
+    participant I as Infobip
+    participant KIn as Input Kafka Topic
+    participant D as Databricks Streaming Job
+    participant S as Databricks Secret Scope
+    participant A as Azure Key Vault
+    participant KOut as Output Kafka Topic
+    participant E as Error Path
+
+    I->>KIn: Publish encrypted CRM event
+    D->>KIn: Read event stream
+    D->>S: Request RSA private key secret
+    S->>A: Resolve secret from Key Vault
+    A-->>S: Return private key
+    S-->>D: Provide private key
+    D->>D: RSA decrypt(encKey)
+    D->>D: AES decrypt configured fields
+    alt Decryption successful
+        D->>KOut: Publish same message structure with decrypted field values
+    else Decryption failed
+        D->>E: Route raw message and failure details
+    end
+```
 
 ## 5. Source Message Characteristics
 
@@ -76,12 +104,12 @@ Infobip publishes CRM-related events where selected fields are encrypted with a 
    - Supports controlled rotation and access governance
 
 5. **Output Layer**
-   - Decrypted bronze/silver table, Delta table, or target sink for downstream CRM usage
-   - Error table or dead-letter output for failed records
+   - Output Kafka topic for downstream CRM usage
+   - Separate error topic or dead-letter sink for failed records
 
 ### 6.2 Logical data flow
 
-`Infobip Kafka Topic -> Databricks Structured Streaming -> JSON Parsing -> AES Key Decryption via RSA Private Key -> Field-Level AES Decryption -> Success Output / Error Output`
+`Infobip Kafka Topic -> Databricks Structured Streaming -> JSON Parsing -> AES Key Decryption via RSA Private Key -> Field-Level AES Decryption -> Output Kafka Topic / Error Output`
 
 ## 7. Detailed Design
 
@@ -92,8 +120,8 @@ The streaming job must be parameterized with:
 - Kafka bootstrap servers / connection settings
 - Source topic name
 - Consumer group or checkpoint location
-- Output sink location/table
-- Error sink location/table
+- Output Kafka topic name
+- Error topic or dead-letter sink
 - Secret scope name
 - Secret key name for RSA private key
 - List of fields to decrypt
@@ -139,20 +167,14 @@ For each message:
    - Decrypt the value using the recovered AES key
    - Replace the encrypted value in the output payload with the plaintext value
 4. Preserve all non-sensitive fields without modification.
-5. Add processing metadata.
+5. Publish the transformed payload to the output Kafka topic without adding new business or operational fields.
 
-### 7.5 Processing metadata
+### 7.5 Output message shape
 
-The output record should include operational metadata such as:
-
-- `decryptionStatus` (`SUCCESS` / `FAILED`)
-- `decryptionTimestamp`
-- `sourceTopic`
-- `sourcePartition`
-- `sourceOffset`
-- `encKeyVersion`
-- `failedFieldName` (for failures, when applicable)
-- `failureReason` (for failures)
+- The success output message keeps the same top-level structure as the input message.
+- Configured sensitive fields are replaced in place with their decrypted plaintext values.
+- No additional fields are appended to the successful output message.
+- Existing non-sensitive fields, including key metadata fields already present in the source payload, pass through unchanged unless a later design explicitly changes that rule.
 
 ## 8. Error Handling
 
@@ -233,6 +255,8 @@ Operational logs must include:
 - source topic / partition / offset range
 - decryption outcome summary
 
+These metrics and logs are operational outputs only and are not appended to the successful Kafka message payload.
+
 Logs must not include decrypted PII or private key contents.
 
 ## 13. Deployment View
@@ -243,7 +267,7 @@ Logs must not include decrypted PII or private key contents.
 - Uses a service principal or managed identity with:
   - Kafka access
   - Databricks secret scope access
-  - output storage/table write access
+  - output Kafka topic write access
 
 ### 13.2 Environment-specific configuration
 
@@ -252,7 +276,7 @@ Each environment must externalize:
 - Kafka endpoints
 - topic names
 - checkpoint locations
-- output locations
+- output Kafka topic names
 - secret scope names
 - secret key names
 - decryptable field list
@@ -261,9 +285,9 @@ Each environment must externalize:
 
 ### 14.1 Successful record
 
-- Original message fields
-- Decrypted values in configured sensitive fields
-- Processing metadata fields
+- Same field structure as the input message
+- Configured sensitive fields decrypted in place
+- No additional fields added to the payload
 
 ### 14.2 Failed record
 
@@ -295,7 +319,7 @@ Each environment must externalize:
 - Confirm the exact AES mode/padding used by Infobip for field encryption.
 - Confirm whether all encrypted fields share the same AES mode and IV handling approach.
 - Confirm whether IV, nonce, or tag data is embedded in each encrypted field value or transported separately.
-- Confirm the target downstream sink and retention policy for error records.
+- Confirm the error-topic or dead-letter retention policy for failed records.
 - Confirm whether any nested fields inside `dataPayload` will require decryption in later phases.
 
 ## 17. Summary
