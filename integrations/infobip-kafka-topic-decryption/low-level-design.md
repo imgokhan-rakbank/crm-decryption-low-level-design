@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-Design a Databricks Spark Structured Streaming pipeline that reads CRM events from an Infobip Kafka topic, decrypts configured sensitive fields, and writes the decrypted payload to a downstream Kafka topic in near real time.
+Design a Databricks Spark Structured Streaming pipeline that reads CRM events from an Infobip Kafka topic, decrypts configured sensitive fields, and writes the decrypted payload to a downstream Kafka topic.
 
 ## 2. Scope
 
@@ -22,7 +22,7 @@ This design does not cover:
 
 ## 3. Business Context
 
-Infobip publishes CRM-related events where selected fields are encrypted with a one-time AES key. The AES key itself is encrypted with the bank-managed RSA public key and added to each message. The bank must use the RSA private key to recover the AES key and decrypt only the configured fields before the data is consumed downstream.
+Infobip publishes CRM-related events where selected fields are encrypted with a one-time AES key. The AES key itself is encrypted with the bank-managed RSA public key and added to each message. The bank must decrypt the AES key and then decrypt the configured sensitive fields before making the message available to downstream CRM consumers.
 
 ## 4. High-Level Flow
 
@@ -31,11 +31,12 @@ Infobip publishes CRM-related events where selected fields are encrypted with a 
 3. The streaming job parses the JSON payload without requiring a fixed schema for all business attributes.
 4. The job reads the encrypted AES key from `encKey` and key version from `encKeyVersion`.
 5. The RSA private key is retrieved from Databricks secrets (Azure Key Vault-backed scope).
-6. The job decrypts `encKey` to obtain the AES key for the current message.
-7. The job decrypts only the configured sensitive fields, such as `from`, `to`, and `text`.
-8. The job writes the decrypted event to an output Kafka topic.
-9. The output payload preserves the same structure as the input payload, with configured sensitive fields replaced in place by plaintext values and no additional fields added.
-10. Records that cannot be decrypted are routed to a dedicated error path with the failure reason and raw payload reference.
+6. The job Base64-decodes `encKey` and decrypts it using `RSA/ECB/OAEPWithSHA-256AndMGF1Padding` to obtain the ephemeral 256-bit AES key.
+7. The job decrypts only the configured sensitive fields, such as `from`, `to`, and `text`, using `AES/GCM/NoPadding`.
+8. For each encrypted field value, the job Base64-decodes the field, extracts the first 12 bytes as the IV, and decrypts the remaining ciphertext plus authentication tag using AES-GCM.
+9. The job writes the decrypted event to an output Kafka topic.
+10. The output payload preserves the same structure as the input payload, with configured sensitive fields replaced in place by plaintext values and no additional fields added.
+11. Records that cannot be decrypted are routed to a dedicated error path with the failure reason and raw payload reference.
 
 ## 4.1 Mermaid sequence diagram
 
@@ -55,8 +56,11 @@ sequenceDiagram
     S->>A: Resolve secret from Key Vault
     A-->>S: Return private key
     S-->>D: Provide private key
-    D->>D: RSA decrypt(encKey)
-    D->>D: AES decrypt configured fields
+    D->>D: Base64 decode encKey
+    D->>D: RSA OAEP SHA-256 decrypt(encKey)
+    D->>D: For each encrypted field, Base64 decode value
+    D->>D: Extract first 12 bytes as IV
+    D->>D: AES-GCM decrypt remaining bytes
     alt Decryption successful
         D->>KOut: Publish same message structure with decrypted field values
     else Decryption failed
@@ -80,6 +84,8 @@ sequenceDiagram
 - Some encrypted fields may be `null`.
 - Encrypted values are Base64-encoded strings.
 - `encKeyVersion` identifies which RSA key version was used by Infobip.
+- A new random AES key is generated for each encryption call and is shared across the encrypted fields in that single message instance.
+- Each encrypted field has its own randomly generated 12-byte IV.
 
 ## 6. Target Architecture
 
@@ -109,7 +115,7 @@ sequenceDiagram
 
 ### 6.2 Logical data flow
 
-`Infobip Kafka Topic -> Databricks Structured Streaming -> JSON Parsing -> AES Key Decryption via RSA Private Key -> Field-Level AES Decryption -> Output Kafka Topic / Error Output`
+`Infobip Kafka Topic -> Databricks Structured Streaming -> JSON Parsing -> RSA OAEP Decryption of encKey -> AES-GCM Field-Level Decryption -> Output Kafka Topic / Error Output`
 
 ## 7. Detailed Design
 
@@ -140,6 +146,8 @@ Example decryptable field list for the first integration:
 - The job retrieves the secret once during initialization and broadcasts or reuses it across executors in a controlled way.
 - The private key must never be logged, persisted, or exposed in output data.
 - Access to the secret scope must be limited to the job identity and authorized operators only.
+- The corresponding public key used upstream is a 2048-bit RSA key encoded as X.509 SubjectPublicKeyInfo and Base64.
+- RSA decryption must use OAEP padding with SHA-256 and MGF1.
 
 ### 7.3 Message parsing strategy
 
@@ -156,20 +164,40 @@ Recommended approach:
 
 Unknown fields must pass through unchanged.
 
-### 7.4 Decryption logic
+### 7.4 Cryptography specification
+
+#### AES (Symmetric Encryption)
+
+- Algorithm: `AES/GCM/NoPadding`
+- Key size: 256 bits
+- IV size: 12 bytes (96 bits)
+- GCM authentication tag length: 128 bits
+- AES key lifecycle: ephemeral; a new random AES key is generated for each encryption call and used to encrypt `from`, `to`, and `text` for that message
+
+#### RSA (Asymmetric Encryption)
+
+- Algorithm: `RSA/ECB/OAEPWithSHA-256AndMGF1Padding`
+- Key type: 2048-bit RSA public key
+- Public key encoding: X.509 SubjectPublicKeyInfo, Base64 encoded
+- Padding: OAEP with SHA-256 and MGF1
+- Purpose: encrypt the ephemeral AES key, which is then stored in the JSON payload as `encKey`
+
+### 7.5 Decryption logic
 
 For each message:
 
 1. Base64-decode `encKey`.
-2. Decrypt `encKey` with the RSA private key to obtain the AES key.
+2. Decrypt `encKey` with the RSA private key using `RSA/ECB/OAEPWithSHA-256AndMGF1Padding` to obtain the ephemeral AES key.
 3. For each configured sensitive field:
    - Base64-decode the field value
-   - Decrypt the value using the recovered AES key
+   - Extract the first 12 bytes as the AES-GCM IV
+   - Use the remaining bytes as ciphertext plus authentication tag
+   - Decrypt the value using `AES/GCM/NoPadding` with the recovered AES key, 12-byte IV, and 128-bit tag length
    - Replace the encrypted value in the output payload with the plaintext value
 4. Preserve all non-sensitive fields without modification.
 5. Publish the transformed payload to the output Kafka topic without adding new business or operational fields.
 
-### 7.5 Output message shape
+### 7.6 Output message shape
 
 - The success output message keeps the same top-level structure as the input message.
 - Configured sensitive fields are replaced in place with their decrypted plaintext values.
@@ -186,7 +214,8 @@ For each message:
 - Unsupported or unexpected key version
 - Invalid Base64 content
 - RSA decryption failure for `encKey`
-- AES decryption failure for one or more target fields
+- AES-GCM authentication failure or decryption failure for one or more target fields
+- Encrypted field payload shorter than the required 12-byte IV length
 - Malformed JSON payload
 
 ### 8.2 Error-handling behavior
@@ -228,11 +257,12 @@ For each message:
 - Do not persist decrypted sensitive values to intermediate debug storage.
 - Use encrypted transport for Kafka connectivity and Databricks platform integrations.
 - Maintain key version awareness through `encKeyVersion` for traceability and future rotation support.
+- Treat AES-GCM authentication failures as security-significant events because they indicate tampering, corruption, or key/IV mismatch.
 
 ## 11. Performance Considerations
 
 - RSA decryption is performed once per message to recover the AES key.
-- AES decryption is then applied only to the configured fields.
+- AES-GCM decryption is then applied only to the configured fields.
 - Reuse initialized cryptographic objects where safely possible within executor constraints.
 - Broadcast immutable key material or parsed key objects carefully to reduce repeated secret retrieval overhead.
 - Tune micro-batch size and parallelism according to Kafka throughput and cryptographic cost.
@@ -316,12 +346,11 @@ Each environment must externalize:
 
 ## 16. Open Points
 
-- Confirm the exact AES mode/padding used by Infobip for field encryption.
-- Confirm whether all encrypted fields share the same AES mode and IV handling approach.
-- Confirm whether IV, nonce, or tag data is embedded in each encrypted field value or transported separately.
+- Confirm whether the encrypted business fields are named `from`, `to`, and `text` in the payload, or whether transport field names such as `encFrom`, `encTo`, and `encText` are used before decryption.
+- Confirm whether any additional authenticated data (AAD) is used in AES-GCM encryption.
 - Confirm the error-topic or dead-letter retention policy for failed records.
 - Confirm whether any nested fields inside `dataPayload` will require decryption in later phases.
 
 ## 17. Summary
 
-The proposed design uses Databricks Structured Streaming to ingest dynamic Infobip Kafka events, retrieve the RSA private key securely from Azure Key Vault through Databricks secrets, decrypt the message-level AES key, and decrypt only the configured sensitive fields. The solution preserves schema flexibility, supports future integrations through configuration, and separates successful and failed processing paths for operational resilience.
+The proposed design uses Databricks Structured Streaming to ingest dynamic Infobip Kafka events, retrieve the RSA private key securely from Azure Key Vault through Databricks secrets, decrypt the per-message ephemeral AES-256 key with RSA OAEP SHA-256, decrypt configured sensitive fields with AES-GCM using a per-field 12-byte IV embedded at the beginning of each field payload, and publish the original message structure with decrypted values to a downstream Kafka topic.
